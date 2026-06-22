@@ -27,7 +27,7 @@
           {% if has_env_key %}
           <div class="field">
             <label class="field-label">API Key</label>
-            <div class="env-key-notice">✓ Using API key from .env</div>
+            <div class="env-key-notice">✓ Using {{ api_key_source_label }}</div>
           </div>
           {% else %}
           <div class="field">
@@ -69,7 +69,7 @@
               </label>
               {% endfor %}
             </div>
-            <p class="helper">Select at least one region. EU is always included for sharp reference.</p>
+            <p class="helper">Select at least one region. EU is always included for sharp reference, but excluded from arbitrage and middle calculations.</p>
           </div>
           <div class="field commission-field">
             <div class="commission-box">
@@ -178,7 +178,7 @@
           <span class="stat-value">0</span>
         </div>
         <div class="stat-card" id="stat-calls">
-          <span class="stat-label">API Calls</span>
+          <span class="stat-label">API Credits</span>
           <span class="stat-value">0</span>
         </div>
       </section>
@@ -662,7 +662,7 @@
         statOpps.textContent = arbData.opportunities_count || opportunities.length;
         statEvents.textContent = summary.events_scanned;
         statSports.textContent = summary.sports_scanned;
-        statCalls.textContent = summary.api_calls_used;
+        statCalls.textContent = summary.api_usage_credits_used ?? summary.api_calls_used ?? 0;
         const totalProfit = opportunities.reduce((sum, opp) => {
           const calc = calculateStakes(opp, parseFloat(stakeInput.value) || stakeValue, true);
           return sum + (calc?.guaranteed_profit || 0);
@@ -679,7 +679,7 @@
           <h3>Summary</h3>
           <p>Found <strong>${arbData.opportunities_count || opportunities.length}</strong> opportunities across <strong>${summary.events_scanned}</strong> events in <strong>${summary.sports_scanned}</strong> sports.</p>
           <p>Total potential profit: <strong>${formatCurrency(totalProfit)}</strong>${totalStaked ? ` on ${formatCurrency(totalStaked)} staked` : ''}</p>
-          <p>API calls used: ${summary.api_calls_used}${regionsLabel ? ` • Regions: ${regionsLabel}` : ''}</p>
+          <p>API credits used: ${summary.api_usage_credits_used ?? summary.api_calls_used ?? 0}${regionsLabel ? ` • Regions: ${regionsLabel}` : ''}</p>
           <p>Exchange commission applied: ${commissionPercent}.</p>
           <p class="helper">ROI = return on total stake. 2% ROI means $2 profit on a $100 stake.</p>
         `;

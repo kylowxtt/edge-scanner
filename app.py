@@ -23,6 +23,7 @@ from config import (
     REGION_OPTIONS,
     SHARP_BOOKS,
 )
+from key_roster import ApiKeyRoster, DEFAULT_ROSTER_PATH, KeyRosterError
 from scanner import run_scan
 
 load_dotenv()
@@ -31,14 +32,27 @@ app = Flask(__name__)
 ENV_API_KEY = os.getenv("ODDS_API_KEY") or os.getenv("THEODDSAPI_API_KEY")
 
 
+def load_key_roster() -> Optional[ApiKeyRoster]:
+    roster = ApiKeyRoster.load(DEFAULT_ROSTER_PATH)
+    if roster and roster.has_enabled_keys():
+        return roster
+    return None
+
+
 @app.route("/")
 def index() -> str:
+    has_key_roster = False
+    try:
+        has_key_roster = bool(load_key_roster())
+    except KeyRosterError:
+        has_key_roster = False
     return render_template(
         "index.html",
         default_sports=DEFAULT_SPORT_OPTIONS,
         region_options=REGION_OPTIONS,
         default_commission_percent=int(DEFAULT_COMMISSION * 100),
-        has_env_key=bool(ENV_API_KEY),
+        has_env_key=has_key_roster or bool(ENV_API_KEY),
+        api_key_source_label="API key roster" if has_key_roster else ".env",
         sharp_books=SHARP_BOOKS,
         default_sharp_book=DEFAULT_SHARP_BOOK,
         default_min_edge_percent=MIN_EDGE_PERCENT,
@@ -51,7 +65,11 @@ def index() -> str:
 @app.route("/scan", methods=["POST"])
 def scan() -> tuple:
     payload = request.get_json(force=True, silent=True) or {}
-    api_key = ENV_API_KEY or (payload.get("apiKey") or "").strip()
+    try:
+        key_roster = load_key_roster()
+    except KeyRosterError as exc:
+        return jsonify({"success": False, "error": str(exc), "error_code": 500}), 500
+    api_key = "" if key_roster else ENV_API_KEY or (payload.get("apiKey") or "").strip()
     sports = payload.get("sports") or []
     all_sports = bool(payload.get("allSports"))
     stake = payload.get("stake")
@@ -105,6 +123,7 @@ def scan() -> tuple:
         min_edge_percent=min_edge_percent,
         bankroll=bankroll_value,
         kelly_fraction=kelly_fraction,
+        key_roster=key_roster,
     )
     status = 200 if result.get("success") else result.get("error_code", 500)
     return jsonify(result), status

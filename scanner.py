@@ -5,8 +5,9 @@ from __future__ import annotations
 import datetime as dt
 import itertools
 import math
+import time
 import uuid
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import requests
 
@@ -35,20 +36,32 @@ from config import (
     SPORT_DISPLAY_NAMES,
     markets_for_sport,
 )
+from key_roster import ApiKeyRoster, EXHAUSTED_MESSAGE, KeyRosterError
 
 BASE_URL = "https://api.the-odds-api.com/v4"
 MIDDLE_MARKETS = {"spreads", "totals"}
 ALLOWED_PLUS_EV_MARKETS = {"h2h", "spreads", "totals"}
 SOFT_BOOK_KEY_SET = set(SOFT_BOOK_KEYS)
 SHARP_BOOK_MAP = {book["key"]: book for book in SHARP_BOOKS}
+REQUEST_TIMEOUT_SECONDS = 30
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+MAX_REQUEST_ATTEMPTS = 3
+SPORTS_CACHE_TTL_SECONDS = 300
+
+_SESSION = requests.Session()
+_SPORTS_CACHE: Optional[List[dict]] = None
+_SPORTS_CACHE_EXPIRES_AT = 0.0
 
 
 class ScannerError(Exception):
     """Raised for recoverable scanner issues."""
 
 
+ApiKeySource = Union[str, ApiKeyRoster]
+
+
 def _iso_now() -> str:
-    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _clamp_commission(rate: float) -> float:
@@ -76,6 +89,49 @@ def _ensure_sharp_region(regions: List[str], sharp_key: str) -> List[str]:
     if required_region and required_region not in seen and required_region in REGION_CONFIG:
         normalized.append(required_region)
     return normalized
+
+
+def _sharp_region(sharp_key: str) -> Optional[str]:
+    region = SHARP_BOOK_MAP.get(sharp_key, {}).get("region", "eu")
+    if region in REGION_CONFIG:
+        return region
+    return None
+
+
+def _calculation_regions(regions: Sequence[str], sharp_key: str) -> List[str]:
+    sharp_region = _sharp_region(sharp_key)
+    return [region for region in regions if region != sharp_region]
+
+
+def _merge_bookmakers(*bookmaker_lists: Sequence[dict]) -> List[dict]:
+    merged: List[dict] = []
+    seen = set()
+    for bookmakers in bookmaker_lists:
+        for book in bookmakers or []:
+            key = book.get("key") or book.get("title")
+            if not key or key in seen:
+                continue
+            merged.append(book)
+            seen.add(key)
+    return merged
+
+
+def _merge_events(primary_events: Sequence[dict], secondary_events: Sequence[dict]) -> List[dict]:
+    merged: Dict[str, dict] = {}
+    order: List[str] = []
+    for events in (primary_events, secondary_events):
+        for event in events or []:
+            event_id = event.get("id") or str(uuid.uuid4())
+            if event_id not in merged:
+                merged[event_id] = {**event}
+                merged[event_id]["bookmakers"] = list(event.get("bookmakers", []))
+                order.append(event_id)
+                continue
+            merged[event_id]["bookmakers"] = _merge_bookmakers(
+                merged[event_id].get("bookmakers", []),
+                event.get("bookmakers", []),
+            )
+    return [merged[event_id] for event_id in order]
 
 
 def _apply_commission(price: float, commission_rate: float, is_exchange: bool) -> float:
@@ -325,28 +381,86 @@ def _format_middle_zone(
     return f"{description_source} by {range_text}"
 
 
-def _request(url: str, params: Dict[str, str]) -> requests.Response:
-    try:
-        resp = requests.get(url, params=params, timeout=30)
-    except requests.RequestException as exc:  # pragma: no cover - network error
-        raise ScannerError(f"Network error: {exc}") from exc
-    if resp.status_code >= 400:
+def _is_usage_exhausted(resp: requests.Response, message: str) -> bool:
+    text = (message or "").lower()
+    remaining = resp.headers.get("x-requests-remaining")
+    return (
+        "out_of_usage_credits" in text
+        or "usage credit limit" in text
+        or "usage credits" in text and "reached" in text
+        or remaining == "0" and resp.status_code in {401, 402, 403, 429}
+    )
+
+
+def _request(url: str, params: Dict[str, str], api_key_source: ApiKeySource) -> requests.Response:
+    last_error: Optional[Exception] = None
+    while True:
         try:
-            payload = resp.json()
-            message = payload.get("message") or payload.get("error")
-        except ValueError:
-            message = resp.text or "Unknown error"
-        raise ScannerError(message or f"API request failed ({resp.status_code})")
-    return resp
+            api_key = api_key_source.get_key() if isinstance(api_key_source, ApiKeyRoster) else api_key_source
+        except KeyRosterError as exc:
+            raise ScannerError(str(exc)) from exc
+
+        request_params = {**params, "apiKey": api_key}
+        for attempt in range(1, MAX_REQUEST_ATTEMPTS + 1):
+            try:
+                resp = _SESSION.get(url, params=request_params, timeout=REQUEST_TIMEOUT_SECONDS)
+            except requests.RequestException as exc:  # pragma: no cover - network error
+                last_error = exc
+                if attempt < MAX_REQUEST_ATTEMPTS:
+                    time.sleep(min(2 ** (attempt - 1), 4))
+                    continue
+                raise ScannerError(f"Network error: {exc}") from exc
+
+            if resp.status_code < 400:
+                if isinstance(api_key_source, ApiKeyRoster):
+                    api_key_source.mark_response(resp.headers)
+                return resp
+
+            try:
+                payload = resp.json()
+                message = payload.get("message") or payload.get("error")
+            except ValueError:
+                message = resp.text or "Unknown error"
+
+            if isinstance(api_key_source, ApiKeyRoster) and _is_usage_exhausted(resp, message):
+                api_key_source.mark_exhausted()
+                break
+
+            if resp.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_REQUEST_ATTEMPTS:
+                time.sleep(2 if resp.status_code == 429 else min(2 ** (attempt - 1), 4))
+                continue
+
+            raise ScannerError(message or f"API request failed ({resp.status_code})")
+
+        if not isinstance(api_key_source, ApiKeyRoster):
+            break
+
+    if last_error is not None:  # pragma: no cover - defensive fallback
+        raise ScannerError(f"Network error: {last_error}") from last_error
+    raise ScannerError("API request failed")
 
 
-def fetch_sports(api_key: str) -> List[dict]:
-    url = f"{BASE_URL}/sports/"
-    resp = _request(url, {"apiKey": api_key})
+def _usage_cost(resp: requests.Response) -> int:
     try:
-        return resp.json()
+        return max(0, int(resp.headers.get("x-requests-last", "0")))
+    except (TypeError, ValueError):
+        return 0
+
+
+def fetch_sports(api_key_source: ApiKeySource) -> List[dict]:
+    global _SPORTS_CACHE, _SPORTS_CACHE_EXPIRES_AT
+    now = time.time()
+    if _SPORTS_CACHE is not None and now < _SPORTS_CACHE_EXPIRES_AT:
+        return list(_SPORTS_CACHE)
+    url = f"{BASE_URL}/sports/"
+    resp = _request(url, {}, api_key_source)
+    try:
+        sports = resp.json()
     except ValueError as exc:  # pragma: no cover - malformed payload
         raise ScannerError("Failed to parse sports list") from exc
+    _SPORTS_CACHE = list(sports)
+    _SPORTS_CACHE_EXPIRES_AT = now + SPORTS_CACHE_TTL_SECONDS
+    return sports
 
 
 def filter_sports(
@@ -359,21 +473,44 @@ def filter_sports(
 
 
 def fetch_odds_for_sport(
-    api_key: str, sport_key: str, markets: Sequence[str], regions: Sequence[str]
-) -> List[dict]:
+    api_key_source: ApiKeySource,
+    sport_key: str,
+    markets: Sequence[str],
+    regions: Optional[Sequence[str]] = None,
+    bookmakers: Optional[Sequence[str]] = None,
+    event_ids: Optional[Sequence[str]] = None,
+    commence_time_from: Optional[str] = None,
+) -> Tuple[List[dict], int]:
     url = f"{BASE_URL}/sports/{sport_key}/odds/"
     params = {
-        "apiKey": api_key,
-        "regions": ",".join(regions),
         "markets": ",".join(markets),
         "oddsFormat": "decimal",
-        "commenceTimeFrom": _iso_now(),
     }
-    resp = _request(url, params)
+    if bookmakers:
+        params["bookmakers"] = ",".join(bookmakers)
+    elif regions:
+        params["regions"] = ",".join(regions)
+    if event_ids:
+        params["eventIds"] = ",".join(event_ids)
+    if commence_time_from:
+        params["commenceTimeFrom"] = commence_time_from
+    resp = _request(url, params, api_key_source)
     try:
-        return resp.json()
+        return resp.json(), _usage_cost(resp)
     except ValueError as exc:  # pragma: no cover
         raise ScannerError(f"Failed to parse odds for {sport_key}") from exc
+
+
+def _event_ids(events: Sequence[dict]) -> List[str]:
+    ids: List[str] = []
+    seen = set()
+    for event in events or []:
+        event_id = event.get("id")
+        if not event_id or event_id in seen:
+            continue
+        ids.append(event_id)
+        seen.add(event_id)
+    return ids
 
 
 OutcomeInfo = Dict[str, object]
@@ -906,7 +1043,7 @@ def _summaries(
     sports_scanned: int,
     events_scanned: int,
     total_profit: float,
-    api_calls_used: int,
+    api_usage_credits_used: int,
 ) -> dict:
     by_sport: Dict[str, int] = {}
     band_counts: Dict[str, int] = {label: 0 for *_, label in ROI_BANDS}
@@ -923,7 +1060,8 @@ def _summaries(
         "by_roi_band": band_counts,
         "sports_scanned": sports_scanned,
         "events_scanned": events_scanned,
-        "api_calls_used": api_calls_used,
+        "api_calls_used": api_usage_credits_used,
+        "api_usage_credits_used": api_usage_credits_used,
         "total_guaranteed_profit": round(total_profit, 2),
     }
 
@@ -1033,7 +1171,7 @@ def _deduplicate_plus_ev(opportunities: List[dict]) -> List[dict]:
 
 
 def run_scan(
-    api_key: str,
+    api_key: str = "",
     sports: Optional[List[str]] = None,
     all_sports: bool = False,
     stake_amount: float = 100.0,
@@ -1043,13 +1181,17 @@ def run_scan(
     min_edge_percent: float = MIN_EDGE_PERCENT,
     bankroll: float = DEFAULT_BANKROLL,
     kelly_fraction: float = DEFAULT_KELLY_FRACTION,
+    key_roster: Optional[ApiKeyRoster] = None,
 ) -> dict:
-    if not api_key:
+    api_key_source: Optional[ApiKeySource] = key_roster if key_roster and key_roster.has_enabled_keys() else api_key
+    if not api_key_source:
         return {"success": False, "error": "API key is required", "error_code": 400}
     if stake_amount is None or stake_amount <= 0:
         stake_amount = 100.0
     normalized_regions = _normalize_regions(regions)
     normalized_regions = _ensure_sharp_region(normalized_regions, sharp_book or DEFAULT_SHARP_BOOK)
+    calculation_regions = _calculation_regions(normalized_regions, sharp_book or DEFAULT_SHARP_BOOK)
+    sharp_region = _sharp_region(sharp_book or DEFAULT_SHARP_BOOK)
     if not normalized_regions:
         return {
             "success": False,
@@ -1058,9 +1200,15 @@ def run_scan(
         }
     commission_rate = _clamp_commission(commission_rate)
     try:
-        sports_list = fetch_sports(api_key)
+        sports_list = fetch_sports(api_key_source)
     except ScannerError as exc:
-        return {"success": False, "error": str(exc), "error_code": 500}
+        error_code = 429 if str(exc) == EXHAUSTED_MESSAGE else 500
+        return {
+            "success": False,
+            "error": str(exc),
+            "error_code": error_code,
+            "api_keys": key_roster.metadata() if key_roster else None,
+        }
 
     filtered = filter_sports(sports_list, sports or DEFAULT_SPORT_KEYS, all_sports)
     if not filtered:
@@ -1089,7 +1237,10 @@ def run_scan(
             "sport_errors": [],
             "partial": False,
             "regions": normalized_regions,
+            "calculation_regions": calculation_regions,
+            "sharp_reference_region": sharp_region,
             "commission_rate": commission_rate,
+            "api_keys": key_roster.metadata() if key_roster else None,
         }
 
     arb_opportunities: List[dict] = []
@@ -1101,28 +1252,93 @@ def run_scan(
     successful_sports = 0
     api_calls_used = 0
     sharp_priority = _sharp_priority(sharp_book or DEFAULT_SHARP_BOOK)
+    sharp_bookmaker_keys = [book["key"] for book in sharp_priority if book.get("key")]
 
     for sport in filtered:
         sport_key = sport.get("key")
         if not sport_key:
             continue
         markets = markets_for_sport(sport_key)
-        api_calls_used += 1
-        try:
-            events = fetch_odds_for_sport(api_key, sport_key, markets, normalized_regions)
-        except ScannerError as exc:
-            sport_errors.append(
-                {
-                    "sport_key": sport_key,
-                    "sport": sport.get("title")
-                    or SPORT_DISPLAY_NAMES.get(sport_key, sport_key),
-                    "error": str(exc),
-                }
-            )
+        calc_events: List[dict] = []
+        sharp_events: List[dict] = []
+        fetch_succeeded = False
+        sport_display = sport.get("title") or SPORT_DISPLAY_NAMES.get(sport_key, sport_key)
+
+        if calculation_regions:
+            try:
+                calc_events, usage_cost = fetch_odds_for_sport(
+                    api_key_source,
+                    sport_key,
+                    markets,
+                    regions=calculation_regions,
+                    commence_time_from=_iso_now(),
+                )
+                api_calls_used += usage_cost
+                fetch_succeeded = True
+            except ScannerError as exc:
+                if str(exc) == EXHAUSTED_MESSAGE:
+                    return {
+                        "success": False,
+                        "error": str(exc),
+                        "error_code": 429,
+                        "api_keys": key_roster.metadata() if key_roster else None,
+                    }
+                sport_errors.append(
+                    {
+                        "sport_key": sport_key,
+                        "sport": sport_display,
+                        "error": f"Calculation regions: {exc}",
+                    }
+                )
+
+        sharp_event_ids = _event_ids(calc_events)
+        should_fetch_sharp = bool(sharp_region) and (
+            not calculation_regions or bool(sharp_event_ids)
+        )
+        if should_fetch_sharp:
+            try:
+                if sharp_event_ids:
+                    sharp_events, usage_cost = fetch_odds_for_sport(
+                        api_key_source,
+                        sport_key,
+                        markets,
+                        bookmakers=sharp_bookmaker_keys,
+                        event_ids=sharp_event_ids,
+                    )
+                else:
+                    sharp_events, usage_cost = fetch_odds_for_sport(
+                        api_key_source,
+                        sport_key,
+                        markets,
+                        regions=[sharp_region],
+                        commence_time_from=_iso_now(),
+                    )
+                api_calls_used += usage_cost
+                fetch_succeeded = True
+            except ScannerError as exc:
+                if str(exc) == EXHAUSTED_MESSAGE:
+                    return {
+                        "success": False,
+                        "error": str(exc),
+                        "error_code": 429,
+                        "api_keys": key_roster.metadata() if key_roster else None,
+                    }
+                sport_errors.append(
+                    {
+                        "sport_key": sport_key,
+                        "sport": sport_display,
+                        "error": f"Sharp reference region ({sharp_region.upper()}): {exc}",
+                    }
+                )
+
+        if not fetch_succeeded:
             continue
+
         successful_sports += 1
-        events_scanned += len(events)
-        for game in events:
+        merged_events = _merge_events(calc_events, sharp_events)
+        events_scanned += len(merged_events)
+
+        for game in calc_events:
             game["sport_key"] = sport_key
             game["sport_title"] = sport.get("title")
             game["sport_display"] = SPORT_DISPLAY_NAMES.get(sport_key, sport_key)
@@ -1138,6 +1354,11 @@ def run_scan(
                         game, market_key, stake_amount, commission_rate
                     )
                     middle_opportunities.extend(middle_entries)
+
+        for game in merged_events:
+            game["sport_key"] = sport_key
+            game["sport_title"] = sport.get("title")
+            game["sport_display"] = SPORT_DISPLAY_NAMES.get(sport_key, sport_key)
             plus_entries = _collect_plus_ev_opportunities(
                 game,
                 markets,
@@ -1193,8 +1414,13 @@ def run_scan(
         "sport_errors": sport_errors,
         "partial": bool(sport_errors),
         "regions": normalized_regions,
+        "calculation_regions": calculation_regions,
+        "sharp_reference_region": sharp_region,
         "commission_rate": commission_rate,
+        "api_keys": key_roster.metadata() if key_roster else None,
     }
+
+
 def _remove_vig(odds_a: float, odds_b: float) -> Tuple[float, float, float]:
     """Return fair odds for both sides plus vig percent."""
     if odds_a <= 1 or odds_b <= 1:

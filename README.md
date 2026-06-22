@@ -34,6 +34,8 @@ Your browser opens automatically. Enter your API key and scan.
 ODDS_API_KEY=your_api_key_here
 ```
 
+For automatic key rotation, copy `api_keys.example.json` to `data/api_keys.json` and add your keys there. The `data/` directory is ignored by git, so the live key roster stays local. When a key runs out of monthly usage credits, the scanner marks it exhausted, retries with the next enabled key, and reactivates exhausted keys after the configured monthly reset.
+
 ## Markets Scanned
 
 | Sport | Markets |
@@ -103,13 +105,3 @@ PRs welcome. Ideas for future versions:
 - Three-way arbitrage (soccer moneylines)
 - Player props
 
-## Support
-
-If this tool saves you time or helps you find an edge, consider buying me a coffee:
-
-[![Buy Me A Coffee](https://img.shields.io/badge/Buy
-## Support
-
-If this tool saves you time or helps you find an edge, consider buying me a coffee:
-
-[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-support-yellow.svg)](https://buymeacoffee.com/deliciouspipe1326)
